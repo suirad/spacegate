@@ -1,25 +1,64 @@
-use std::{io::Write, net::SocketAddrV4, str::FromStr};
+use std::{
+    io::Write,
+    net::{IpAddr, SocketAddrV4, SocketAddrV6},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Result;
 use iroh::{
+    dns::DnsResolver,
     endpoint::{Connection, RecvStream, SendStream},
     Endpoint, SecretKey,
+};
+use tokio::net::TcpStream;
+use tokio_rustls::{
+    rustls::{
+        crypto::{self, CryptoProvider},
+        ClientConfig, RootCertStore,
+    },
+    TlsConnector,
 };
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // cli
-    let target = "localhost:3000".to_string();
+
+    CryptoProvider::install_default(crypto::aws_lc_rs::default_provider())
+        .expect("Failed to setup CryptoProvider");
+
+    let target = "maincloud.spacetimedb.com:443".to_string();
     let privkey = create_key("fancykey");
+
+    // resolve fly-global-services
+    let addr = DnsResolver::new()
+        .lookup_ipv4_ipv6("fly-global-services", Duration::from_secs(3))
+        .await?
+        .next()
+        .unwrap();
+    //let addr: IpAddr = "0.0.0.0:8080".parse()?;
+
+    println!("Using Addr: {}", &addr);
 
     let endpoint = Endpoint::builder()
         .secret_key(SecretKey::from_bytes(&privkey))
         .alpns(vec!["maincloud".into()])
         .clear_discovery()
-        .relay_mode(iroh::RelayMode::Disabled)
-        .bind_addr_v4(SocketAddrV4::from_str("0.0.0.0:8080")?)
-        .bind()
-        .await?;
+        .relay_mode(iroh::RelayMode::Disabled);
+
+    let endpoint = if let IpAddr::V4(v4) = addr {
+        endpoint
+            .bind_addr_v4(SocketAddrV4::new(v4, 8080))
+            .bind()
+            .await?
+    } else if let IpAddr::V6(v6) = addr {
+        endpoint
+            .bind_addr_v6(SocketAddrV6::new(v6, 8080, 0, 0))
+            .bind()
+            .await?
+    } else {
+        unreachable!("Failed to bind endpoint");
+    };
 
     println!(
         "Successfully Initialized\nNode addr: {:#?}",
@@ -83,8 +122,25 @@ async fn proxy_stream(
     target: String,
     desc: String,
 ) -> Result<()> {
-    let mut target_conn = tokio::net::TcpStream::connect(target).await?;
-    let (mut trecv, mut tsend) = target_conn.split();
+    let stream = TcpStream::connect(&target)
+        .await
+        .expect("Failed to connect to target server");
+
+    let root_store = RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.into(),
+    };
+
+    let config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    let connector = TlsConnector::from(Arc::new(config));
+
+    let tls = connector
+        .connect("maincloud.spacetimedb.com".try_into().unwrap(), stream)
+        .await?;
+
+    let (mut trecv, mut tsend) = tokio::io::split(tls);
 
     tokio::select! {
         biased;

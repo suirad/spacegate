@@ -1,3 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["client", "proxy"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = "symbols"
