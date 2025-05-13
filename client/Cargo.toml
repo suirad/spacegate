@@ -1,10 +1,12 @@
 [package]
 name = "spacegate"
-version = "0.1.0"
+version = "1.1.0"
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0.97"
-iroh = "0.34.0"
-iroh-base = "0.34.0"
+clap = { version = "4.5.38", features = ["derive"] }
+iroh = "0.35.0"
 tokio = "1.44.1"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }

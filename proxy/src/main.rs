@@ -6,10 +6,11 @@ use std::{
 };
 
 use anyhow::Result;
+use clap::Parser;
 use iroh::{
     dns::DnsResolver,
     endpoint::{Connection, RecvStream, SendStream},
-    Endpoint, SecretKey,
+    Endpoint, RelayMode, SecretKey,
 };
 use tokio::net::TcpStream;
 use tokio_rustls::{
@@ -19,70 +20,80 @@ use tokio_rustls::{
     },
     TlsConnector,
 };
+use tracing::{error, info};
+use tracing_subscriber::{self, EnvFilter};
+
+#[derive(Debug, Parser)]
+struct Args {
+    #[arg(
+        short = 'a',
+        long,
+        default_value = "0.0.0.0",
+        required_if_eq("fly", "false")
+    )]
+    bind_addr: String,
+
+    #[arg(
+        short = 'p',
+        long,
+        default_value_t = 3002,
+        required_if_eq("fly", "false")
+    )]
+    bind_port: u16,
+
+    #[arg(
+        short = 't',
+        long,
+        default_value = "localhost:3000",
+        required_if_eq("fly", "false"),
+        help = "Target address:port to forward traffic to"
+    )]
+    target_uri: String,
+
+    #[arg(long, hide = true, default_value_t = false)]
+    fly: bool,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // cli
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new("spacegate_proxy=info"))
+        .init();
+
+    let mut args = Args::parse();
 
     CryptoProvider::install_default(crypto::aws_lc_rs::default_provider())
         .expect("Failed to setup CryptoProvider");
 
-    let target = "maincloud.spacetimedb.com:443".to_string();
-    let privkey = create_key("fancykey");
-
-    // resolve fly-global-services
-    let addr = DnsResolver::new()
-        .lookup_ipv4_ipv6("fly-global-services", Duration::from_secs(3))
-        .await?
-        .next()
-        .unwrap();
-    //let addr: IpAddr = "0.0.0.0:8080".parse()?;
-
-    println!("Using Addr: {}", &addr);
-
-    let endpoint = Endpoint::builder()
-        .secret_key(SecretKey::from_bytes(&privkey))
-        .alpns(vec!["maincloud".into()])
-        .clear_discovery()
-        .relay_mode(iroh::RelayMode::Disabled);
-
-    let endpoint = if let IpAddr::V4(v4) = addr {
-        endpoint
-            .bind_addr_v4(SocketAddrV4::new(v4, 8080))
-            .bind()
-            .await?
-    } else if let IpAddr::V6(v6) = addr {
-        endpoint
-            .bind_addr_v6(SocketAddrV6::new(v6, 8080, 0, 0))
-            .bind()
-            .await?
+    let endpoint = if args.fly {
+        start_server_fly(&mut args).await?
     } else {
-        unreachable!("Failed to bind endpoint");
+        start_server_local(&mut args).await?
     };
 
-    println!(
-        "Successfully Initialized\nNode addr: {:#?}",
+    info!(
+        "Successfully Initialized\nNode info: {:#?}",
         endpoint.node_addr().await?
     );
 
-    println!("Accepting connections");
+    info!("Accepting connections");
     loop {
         let Some(acc) = endpoint.accept().await else {
-            eprintln!("Endpoint closed");
+            error!("Endpoint closed");
             return Ok(());
         };
 
         let Ok(partial_conn) = acc.accept() else {
-            eprintln!("Error accepting");
+            error!("Error accepting");
             continue;
         };
 
         let Ok(conn) = partial_conn.await else {
-            eprintln!("Error completing connection");
+            error!("Error completing connection");
             continue;
         };
 
-        let targ = target.clone();
+        let targ = args.target_uri.clone();
         tokio::spawn(async move { handle_conn(conn, targ).await });
     }
 }
@@ -97,17 +108,73 @@ fn create_key(key: &str) -> [u8; 32] {
     key
 }
 
+async fn _start_server(args: &Args, alpn: &str, skey: Option<SecretKey>) -> Result<Endpoint> {
+    let addr: IpAddr = args.bind_addr.parse()?;
+
+    info!("Using Addr: {}:{}", &addr, args.bind_port);
+
+    let endpoint = Endpoint::builder().alpns(vec![alpn.into()]);
+
+    let endpoint = if let Some(key) = skey {
+        endpoint
+            .secret_key(key)
+            .clear_discovery()
+            .relay_mode(RelayMode::Disabled)
+    } else {
+        endpoint.discovery_n0()
+    };
+
+    let endpoint = if let IpAddr::V4(v4) = addr {
+        endpoint
+            .bind_addr_v4(SocketAddrV4::new(v4, args.bind_port))
+            .bind()
+            .await?
+    } else if let IpAddr::V6(v6) = addr {
+        endpoint
+            .bind_addr_v6(SocketAddrV6::new(v6, args.bind_port, 0, 0))
+            .bind()
+            .await?
+    } else {
+        unreachable!("Failed to bind endpoint");
+    };
+
+    Ok(endpoint)
+}
+
+async fn start_server_local(args: &mut Args) -> Result<Endpoint> {
+    _start_server(args, "stdb", None).await
+}
+
+async fn start_server_fly(args: &mut Args) -> Result<Endpoint> {
+    args.target_uri = "maincloud.spacetimedb.com:443".into();
+    args.bind_addr = "fly-global-services".into();
+    args.bind_port = 8080;
+
+    let addr = DnsResolver::new()
+        .lookup_ipv4_ipv6(&args.bind_addr, Duration::from_secs(3))
+        .await?
+        .next()
+        .unwrap();
+    args.bind_addr = addr.to_string();
+
+    // use a stable key for constant discoverability
+    let privkey = create_key("fancykey");
+    let key = SecretKey::from_bytes(&privkey);
+
+    _start_server(args, "maincloud", Some(key)).await
+}
+
 async fn handle_conn(conn: Connection, target: String) -> Result<()> {
-    println!("New connection ID: {}", conn.stable_id());
+    info!("New connection ID: {}", conn.stable_id());
 
     loop {
         let Ok((send, recv)) = conn.accept_bi().await else {
-            println!("Connection closed for ID: {}", conn.stable_id());
+            info!("Connection closed for ID: {}", conn.stable_id());
             break;
         };
 
         let desc = format!("{}:{}", conn.stable_id(), recv.id().index());
-        println!("Starting proxy for {}", &desc);
+        info!("Starting proxy for {}", &desc);
 
         let targ = target.clone();
         tokio::spawn(async move { proxy_stream(send, recv, targ, desc).await });
@@ -148,6 +215,6 @@ async fn proxy_stream(
         _ = tokio::io::copy(&mut trecv, &mut send) => {},
     }
 
-    println!("Proxy Finished for {}", desc);
+    info!("Proxy Finished for {}", desc);
     Ok(())
 }
