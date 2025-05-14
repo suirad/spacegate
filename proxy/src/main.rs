@@ -23,7 +23,7 @@ use tokio_rustls::{
     },
     TlsConnector,
 };
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use tracing_subscriber::{self, EnvFilter};
 
 #[derive(Debug, Parser)]
@@ -55,12 +55,15 @@ struct Args {
 
     #[arg(long, hide = true, default_value_t = false)]
     fly: bool,
+
+    #[arg(long, hide = true, default_value_t = false)]
+    debug: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new("spacegate_proxy=info"))
+        .with_env_filter(EnvFilter::new("spacegate_proxy=debug"))
         .init();
 
     let mut args = Args::parse();
@@ -73,6 +76,8 @@ async fn main() -> Result<()> {
     } else {
         start_server_local(&mut args).await?
     };
+
+    let args = Arc::new(args);
 
     info!(
         "Successfully Initialized\nNode info: {:#?}",
@@ -96,8 +101,8 @@ async fn main() -> Result<()> {
             continue;
         };
 
-        let targ = args.target_uri.clone();
-        tokio::spawn(async move { handle_conn(conn, targ).await });
+        let cargs = args.clone();
+        tokio::spawn(async move { handle_conn(conn, cargs).await });
     }
 }
 
@@ -167,7 +172,7 @@ async fn start_server_fly(args: &mut Args) -> Result<Endpoint> {
     _start_server(args, "maincloud", Some(key)).await
 }
 
-async fn handle_conn(conn: Connection, target: String) -> Result<()> {
+async fn handle_conn(conn: Connection, args: Arc<Args>) -> Result<()> {
     info!("New connection ID: {}", conn.stable_id());
 
     loop {
@@ -179,8 +184,8 @@ async fn handle_conn(conn: Connection, target: String) -> Result<()> {
         let desc = format!("{}:{}", conn.stable_id(), recv.id().index());
         info!("Starting proxy for {}", &desc);
 
-        let targ = target.clone();
-        tokio::spawn(async move { proxy_stream(send, recv, targ, desc).await });
+        let cargs = args.clone();
+        tokio::spawn(async move { proxy_stream(send, recv, cargs, desc).await });
     }
 
     Ok(())
@@ -189,14 +194,15 @@ async fn handle_conn(conn: Connection, target: String) -> Result<()> {
 async fn proxy_stream(
     mut send: SendStream,
     mut recv: RecvStream,
-    target: String,
+    args: Arc<Args>,
     desc: String,
 ) -> Result<()> {
-    let stream = TcpStream::connect(&target)
+    let stream = TcpStream::connect(&args.target_uri)
         .await
         .expect("Failed to connect to target server {target}");
 
-    let (host, port): (String, u16) = target
+    let (host, port): (String, u16) = args
+        .target_uri
         .split_once(':')
         .map(|(h, p)| (h.to_owned(), p.parse().unwrap()))
         .unwrap();
@@ -219,9 +225,10 @@ async fn proxy_stream(
                 .await?;
             let (mut trecv, mut tsend) = tokio::io::split(tls);
 
-            if let Err(e) = rewrite_host_header(&mut recv, &mut tsend, &host).await {
+            if let Err(e) = rewrite_host_header(&mut recv, &mut tsend, &host, args).await {
                 panic!("Error parsing host header out of request: {e}");
             }
+
             tokio::select! {
                 biased;
                 _ = tokio::io::copy(&mut recv, &mut tsend) => {},
@@ -229,12 +236,17 @@ async fn proxy_stream(
             }
         }
         _ => {
-            let conn = TcpStream::connect(&target).await?;
+            let conn = TcpStream::connect(&args.target_uri).await?;
             let (mut trecv, mut tsend) = tokio::io::split(conn);
 
-            if let Err(e) = rewrite_host_header(&mut recv, &mut tsend, &host).await {
-                panic!("Error parsing host header out of request: {e}");
+            if args.debug {
+                if let Err(e) =
+                    rewrite_host_header(&mut recv, &mut tsend, &args.target_uri.clone(), args).await
+                {
+                    panic!("Error parsing host header out of request: {e}");
+                }
             }
+
             tokio::select! {
                 biased;
                 _ = tokio::io::copy(&mut recv, &mut tsend) => {},
@@ -251,8 +263,10 @@ async fn rewrite_host_header<T: tokio::io::AsyncWrite>(
     recv: &mut RecvStream,
     prox_send: &mut WriteHalf<T>,
     new_host: &str,
+    args: Arc<Args>,
 ) -> Result<()> {
-    let mut buf = [0u8; 200];
+    // buf size is arbitrary, just large enough to capture head header during module publish
+    let mut buf = [0u8; 640];
 
     let len = recv.read(&mut buf).await?.unwrap_or(0);
 
@@ -264,8 +278,18 @@ async fn rewrite_host_header<T: tokio::io::AsyncWrite>(
             "Host: ".as_bytes(),
             new_host.as_bytes(),
             "\n".as_bytes(),
-            post_host.split_once('\n').unwrap().1.as_bytes(),
+            post_host.split_once('\n').unwrap_or(("", "")).1.as_bytes(),
+            if data.len() < buf.len() {
+                "\n".as_bytes()
+            } else {
+                "".as_bytes()
+            },
         ];
+
+        if args.debug {
+            let msg = String::from_iter(chunks.iter().map(|c| std::str::from_utf8(c).unwrap()));
+            debug!("Patched headers from:\n'{data:#}'\nto\n'{msg:#}'");
+        }
 
         for chunk in chunks {
             prox_send.write_all(chunk).await?;
@@ -276,14 +300,31 @@ async fn rewrite_host_header<T: tokio::io::AsyncWrite>(
             "host: ".as_bytes(),
             new_host.as_bytes(),
             "\n".as_bytes(),
-            post_host.split_once('\n').unwrap().1.as_bytes(),
+            post_host.split_once('\n').unwrap_or(("", "")).1.as_bytes(),
+            if data.len() < buf.len() {
+                "\n".as_bytes()
+            } else {
+                "".as_bytes()
+            },
         ];
+
+        if args.debug {
+            let msg = String::from_iter(chunks.iter().map(|c| std::str::from_utf8(c).unwrap()));
+            debug!("Patched headers from:\n'{data:#}'\nto\n'{msg:#}'");
+        }
 
         for chunk in chunks {
             prox_send.write_all(chunk).await?;
         }
     } else {
-        prox_send.write_all(&buf[0..len]).await?;
+        if args.debug {
+            debug!(
+                "Forwarding http connection without patching Host header:\n{:#}",
+                &data
+            );
+        }
+
+        prox_send.write_all(&buf).await?;
     }
 
     Ok(())

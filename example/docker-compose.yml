@@ -1,0 +1,15 @@
+services:
+  db:
+    networks: [stdb]
+    image: clockworklabs/spacetime:v1.1.0
+    command: start
+
+  proxy:
+    networks: [stdb]
+    build:
+      dockerfile: Dockerfile
+    command: /bin/spacegate-proxy -t db:3000
+
+networks:
+  stdb:
+

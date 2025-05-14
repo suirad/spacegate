@@ -8,5 +8,5 @@ lto = "fat"
 codegen-units = 1
 strip = "symbols"
 
-[profile.release.package.proxy]
+[profile.release.package.spacegate-proxy]
 opt-level = 3
